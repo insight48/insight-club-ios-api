@@ -125,6 +125,15 @@ function canWrite(role, table) {
 
 export default {
   async fetch(request, env) {
+    try {
+      return await handle(request, env);
+    } catch (e) {
+      return json({ error: "DEBUG_EXCEPTION", message: String(e && e.message), stack: String(e && e.stack) }, 500);
+    }
+  },
+};
+
+async function handle(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -228,5 +237,4 @@ export default {
     }
 
     return err("المسار غير موجود", 404);
-  },
-};
+}
