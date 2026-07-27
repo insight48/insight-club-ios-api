@@ -67,8 +67,8 @@ function b64(bytes) { return btoa(String.fromCharCode(...bytes)); }
 function unb64(str) { return Uint8Array.from(atob(str), c => c.charCodeAt(0)); }
 
 async function signToken(payload, secret) {
-  const encHeader = b64url(JSON.stringify({ alg: "HS256" }));
-  const encPayload = b64url(JSON.stringify(payload));
+  const encHeader = b64urlFromUtf8(JSON.stringify({ alg: "HS256" }));
+  const encPayload = b64urlFromUtf8(JSON.stringify(payload));
   const data = `${encHeader}.${encPayload}`;
   return `${data}.${await hmac(data, secret)}`;
 }
@@ -77,17 +77,30 @@ async function verifyToken(token, secret) {
   if (parts.length !== 3) return null;
   const [h, p, sig] = parts;
   if (await hmac(`${h}.${p}`, secret) !== sig) return null;
-  const payload = JSON.parse(atobUrl(p));
+  const payload = JSON.parse(utf8FromB64url(p));
   if (payload.exp < Math.floor(Date.now() / 1000)) return null;
   return payload;
 }
 async function hmac(data, secret) {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
-  return b64url(String.fromCharCode(...new Uint8Array(sig)));
+  return b64urlFromBytes(new Uint8Array(sig));
 }
-function b64url(str) { return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
-function atobUrl(str) { return atob(str.replace(/-/g, "+").replace(/_/g, "/")); }
+// -- UTF-8-safe base64url helpers (root-cause fix for Arabic/non-Latin1 payloads) --
+function b64urlFromBytes(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlFromUtf8(str) {
+  return b64urlFromBytes(new TextEncoder().encode(str));
+}
+function utf8FromB64url(str) {
+  const b64 = str.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
 
 function getAuth(request) {
   const h = request.headers.get("Authorization") || "";
