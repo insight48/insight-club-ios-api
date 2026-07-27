@@ -145,6 +145,18 @@ export default {
     }
 
     // ---------- تسجيل الدخول ----------
+    // ---------- نقطة فحص مؤقتة (آمنة، ما تكشف كلمات مرور) ----------
+    if (request.method === "GET" && path === "/debug/roles") {
+      const { results } = await env.DB.prepare("SELECT data FROM records WHERE table_name = 'committees'").all();
+      const committeeNames = results.map(r => {
+        const name = JSON.parse(r.data).name;
+        return { name, codes: Array.from(name).map(c => c.codePointAt(0).toString(16)) };
+      });
+      const cfg = await getAuthConfig(env);
+      const configKeys = Object.keys(cfg.committeePasswordHashes).map(k => ({ key: k, codes: Array.from(k).map(c => c.codePointAt(0).toString(16)) }));
+      return json({ committeeNames, configKeys });
+    }
+
     if (request.method === "POST" && path === "/auth/login") {
       const { role, password } = await request.json().catch(() => ({}));
       if (!role || !password) return err("الدور وكلمة المرور مطلوبة");
