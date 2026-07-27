@@ -140,7 +140,7 @@ export default {
 
 
     // ---------- تقديم الواجهة نفسها (الملف الكامل) لأي طلب مو API ----------
-    if (request.method === "GET" && !path.startsWith("/api/") && !path.startsWith("/auth/")) {
+    if (request.method === "GET" && !path.startsWith("/api/") && !path.startsWith("/auth/") && !path.startsWith("/debug/")) {
       return new Response(HTML_PAGE, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
 
