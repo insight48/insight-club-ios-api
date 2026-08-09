@@ -3,7 +3,7 @@
 // تخزين عام: كل جدول منطقي يُخزَّن كصفوف JSON داخل جدول records الواحد
 // ============================================================
 
-const LEADER_ONLY_TABLES = ["committees", "positions", "club_info"];
+const LEADER_ONLY_TABLES = ["committees", "positions", "club_info", "permission_overrides"];
 const COMMITTEE_TABLES = {
   content_items: "الإعلام وصناعة الأثر",
   partners: "العلاقات",
@@ -743,6 +743,149 @@ function canWrite(role, table, method) {
   return !!r;
 }
 
+// ============================================================
+// Permission Resolution Engine (إضافة آمنة — لا تلغي canWrite، بل تغلّفها)
+// resolvePermission يبقى الحارس الوحيد الجديد على مسارات الكتابة، ويستخدم
+// canWrite كـ"ملف الصلاحيات الافتراضي حسب الدور" عند غياب أي حالة أخص.
+// ترتيب الأولوية: صلاحية سيادية (leader) > Override صريح > سياق (Project Leader / Own Task) > الافتراضي (canWrite).
+// ============================================================
+
+const OWN_TASK_EDITABLE_FIELDS = ["status", "completionPercent", "dueDate", "notes"];
+
+async function getRecordById(env, table, id) {
+  if (!id) return null;
+  const row = await env.DB.prepare("SELECT data FROM records WHERE table_name = ? AND id = ?").bind(table, id).first();
+  return row ? JSON.parse(row.data) : null;
+}
+
+async function getPermissionOverrides(env, memberId) {
+  if (!memberId) return [];
+  const { results } = await env.DB.prepare("SELECT data FROM records WHERE table_name = ?").bind("permission_overrides").all();
+  return results.map(r => JSON.parse(r.data)).filter(o => o.memberId === memberId);
+}
+
+function fieldsChanged(oldObj, newObj) {
+  const keys = new Set([...Object.keys(oldObj || {}), ...Object.keys(newObj || {})]);
+  const changed = [];
+  for (const k of keys) {
+    if (JSON.stringify((oldObj || {})[k]) !== JSON.stringify((newObj || {})[k])) changed.push(k);
+  }
+  return changed;
+}
+
+// ============================================================
+// PermissionEngine — نقطة تحقق مركزية واحدة لصلاحيات الأعضاء الصريحة
+// PermissionEngine.can(user, "table.action") — لا منطق صلاحيات متفرق في الكود
+// user هنا هو سجل العضو الفعلي (وليس فقط التوكن) لضمان قراءة الصلاحيات والحالة حيّة من القاعدة في كل طلب
+// ============================================================
+const PermissionEngine = {
+  can(user, permKey) {
+    if (!user) return false;
+    if (normalizeRole(user.role) === "leader") return true; // Super Admin: كل الصلاحيات دائمًا
+    if (user.accountStatus === "disabled") return false; // حساب معطّل = صفر وصول، بلا استثناء
+    const perms = Array.isArray(user.permissions) ? user.permissions : null;
+    if (!perms) return null; // null = لا يوجد نظام صلاحيات صريح على هذا الحساب بعد (عضو لجنة قديم) → استخدم الافتراضي القديم
+    const [ns] = permKey.split(".");
+    return perms.includes(permKey) || perms.includes(ns + ".*") || perms.includes("*");
+  },
+};
+
+const ACCESS_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // بدون أحرف/أرقام ملتبسة (O/0, I/1)
+function generateAccessCodePlain() {
+  let out = "";
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  for (let i = 0; i < 8; i++) out += ACCESS_CODE_ALPHABET[bytes[i] % ACCESS_CODE_ALPHABET.length];
+  return out;
+}
+async function hashAccessCode(code, secret) {
+  return hmac("access_code:" + code, secret); // hmac() موجودة أصلاً — نفس آلية توقيع التوكن، حتمية وسريعة البحث
+}
+async function findMemberByAccessCode(env, code, secret) {
+  const targetHash = await hashAccessCode(code, secret);
+  const { results } = await env.DB.prepare("SELECT data FROM records WHERE table_name = ?").bind("members").all();
+  for (const r of results) {
+    const m = JSON.parse(r.data);
+    if (m.accessCodeHash && m.accessCodeHash === targetHash) return m;
+  }
+  return null;
+}
+async function generateUniqueAccessCode(env, secret) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const plain = generateAccessCodePlain();
+    const hash = await hashAccessCode(plain, secret);
+    const existing = await findMemberByAccessCode(env, plain, secret);
+    if (!existing) return { plain, hash };
+  }
+  throw new Error("تعذّر توليد access_code فريد بعد عدة محاولات");
+}
+const MEMBER_SENSITIVE_FIELDS = ["permissions", "role", "accountStatus", "accessCodeHash"];
+
+async function resolvePermission(env, payload, action, table, id, body) {
+  const role = payload && payload.role;
+  const memberId = payload && payload.memberId;
+
+  // 1) صلاحية سيادية — القائد يملك كل شيء دائمًا
+  if (normalizeRole(role) === "leader") {
+    return { allowed: true, source: "LEADER", scope: "GLOBAL" };
+  }
+
+  // 1B) حساب معطَّل — منع فوري لكل شيء بلا استثناء (البند 9)
+  let __member = null;
+  if (memberId) {
+    __member = await getRecordById(env, "members", memberId);
+    if (__member && __member.accountStatus === "disabled") {
+      return { allowed: false, source: "ACCOUNT_DISABLED", scope: "NONE", reason: "الحساب معطَّل — لا يمكن استخدام المنصة" };
+    }
+  }
+
+  // 1C) صلاحيات صريحة عبر PermissionEngine — إذا كان للعضو حساب بنظام صلاحيات صريح (permissions[]) فهو المصدر الحاكم
+  if (memberId && __member && Array.isArray(__member.permissions)) {
+    const actionWord = action === "CREATE" ? "create" : action === "DELETE" ? "delete" : action === "EDIT" ? "edit" : action.toLowerCase();
+    const permKey = table + "." + actionWord;
+    const decision = PermissionEngine.can({ role, permissions: __member.permissions, accountStatus: __member.accountStatus }, permKey);
+    if (decision === true) return { allowed: true, source: "MEMBER_PERMISSION", scope: "OWN" };
+    if (decision === false) return { allowed: false, source: "MEMBER_PERMISSION", scope: "OWN", reason: "لا تملك صلاحية \"" + permKey + "\"" };
+    // decision === null لا يحدث هنا لأن permissions مصفوفة فعلاً — نكمل احتياطًا فقط
+  }
+
+  // 2) Override صريح مخصّص لهذا العضو تحديدًا (يفوز دائمًا، سماحًا أو منعًا)
+  if (memberId) {
+    const overrides = await getPermissionOverrides(env, memberId);
+    const match = overrides.find(o =>
+      o.table === table &&
+      o.action === action &&
+      (!o.scopeId || o.scopeId === id)
+    );
+    if (match) {
+      return { allowed: !!match.granted, source: "OVERRIDE", scope: match.scope || "RECORD" };
+    }
+  }
+
+  // 3) سياقات معروفة (Contextual Permissions) — بدون المساس بمنطق الأداء أو قاعدة البيانات
+  if (memberId && table === "projects" && id && (action === "EDIT" || action === "ASSIGN" || action === "CLOSE")) {
+    const project = await getRecordById(env, "projects", id);
+    if (project && project.leadMemberId === memberId) {
+      return { allowed: true, source: "PROJECT_LEADER", scope: "PROJECT" };
+    }
+  }
+  if (memberId && table === "standaloneTasks" && id && action === "EDIT") {
+    const task = await getRecordById(env, "standaloneTasks", id);
+    if (task && task.assigneeMemberId === memberId) {
+      const changed = fieldsChanged(task, body || {});
+      const disallowed = changed.filter(f => !OWN_TASK_EDITABLE_FIELDS.includes(f) && f !== "id" && f !== "assigneeMemberId" ? true : f === "assigneeMemberId" && (body || {}).assigneeMemberId !== task.assigneeMemberId);
+      if (disallowed.length === 0) {
+        return { allowed: true, source: "OWN_TASK", scope: "OWN" };
+      }
+      return { allowed: false, source: "OWN_TASK_FIELD_RESTRICTED", scope: "OWN", reason: "لا يمكن للعضو تعديل إلا الحالة/نسبة الإنجاز/الموعد/الملاحظات في مهمته الخاصة" };
+    }
+  }
+
+  // 4) الافتراضي — نفس سلوك النظام الحالي بالحرف (لا كسر لأي جلسة قائمة)
+  const methodForCanWrite = action === "CREATE" ? "POST" : action === "DELETE" ? "DELETE" : "PUT";
+  return { allowed: canWrite(role, table, methodForCanWrite), source: "ROLE_DEFAULT", scope: COMMITTEE_TABLES[table] ? "COMMITTEE" : (LEADER_ONLY_TABLES.includes(table) ? "GLOBAL" : "SHARED") };
+}
+
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -783,7 +926,39 @@ async function handle(request, env, ctx) {
     }
 
     if (request.method === "POST" && path === "/auth/login") {
-      const { role, password } = await request.json().catch(() => ({}));
+      const loginBody = await request.json().catch(() => ({}));
+      const { role, password, memberId, personalCode, access_code } = loginBody;
+
+      // -- تسجيل دخول العضو بـ access_code (المسار الأساسي لنظام Members/Users) --
+      if (access_code) {
+        const member = await findMemberByAccessCode(env, String(access_code).trim(), getSecret(env));
+        if (!member) return err("رمز الدخول غير صحيح", 401);
+        if (member.accountStatus === "disabled") return err("الحساب معطَّل — تواصل مع قائد النادي", 403);
+        let memberRole = "member";
+        if (member.committeeId) {
+          const committee = await getRecordById(env, "committees", member.committeeId);
+          if (committee && committee.name) memberRole = committee.name;
+        }
+        const token = await signToken({ role: memberRole, memberId: member.id, exp: Math.floor(Date.now() / 1000) + 30 * 24 * 3600 }, getSecret(env));
+        return json({ token, role: memberRole, memberId: member.id, memberName: member.name, permissions: Array.isArray(member.permissions) ? member.permissions : [] });
+      }
+
+      // -- تسجيل دخول فردي بالرمز الشخصي (المسار القديم — يبقى للتوافق الخلفي) --
+      if (memberId && personalCode) {
+        const member = await getRecordById(env, "members", memberId);
+        if (!member || !member.personalCodeHash) return err("لا يوجد رمز دخول شخصي مفعّل لهذا العضو", 401);
+        const okPersonal = await verifyPassword(personalCode, member.personalCodeHash);
+        if (!okPersonal) return err("الرمز الشخصي غير صحيح", 401);
+        let memberRole = "member";
+        if (member.committeeId) {
+          const committee = await getRecordById(env, "committees", member.committeeId);
+          if (committee && committee.name) memberRole = committee.name;
+        }
+        const token = await signToken({ role: memberRole, memberId: member.id, exp: Math.floor(Date.now() / 1000) + 30 * 24 * 3600 }, getSecret(env));
+        return json({ token, role: memberRole, memberId: member.id, memberName: member.name });
+      }
+
+      // -- تسجيل الدخول الحالي بكلمة مرور اللجنة/القائد (بلا تغيير) --
       if (!role || !password) return err("الدور وكلمة المرور مطلوبة");
       const cfg = await getAuthConfig(env);
       let ok = false;
@@ -792,6 +967,21 @@ async function handle(request, env, ctx) {
       if (!ok) return err("كلمة المرور غير صحيحة", 401);
       const token = await signToken({ role, exp: Math.floor(Date.now() / 1000) + 30 * 24 * 3600 }, getSecret(env));
       return json({ token, role });
+    }
+
+    if (request.method === "POST" && path === "/auth/set-personal-code") {
+      const payload = await verifyToken(getAuth(request), getSecret(env));
+      if (!payload || normalizeRole(payload.role) !== "leader") return err("غير مصرّح — للقائد فقط", 403);
+      const { memberId: targetId, personalCode: newCode } = await request.json().catch(() => ({}));
+      if (!targetId || !newCode) return err("memberId و personalCode مطلوبان");
+      const member = await getRecordById(env, "members", targetId);
+      if (!member) return err("العضو غير موجود", 404);
+      member.personalCodeHash = await hashPassword(newCode);
+      const stmt = env.DB.prepare(
+        "INSERT INTO records (table_name, id, data) VALUES ('members', ?, ?) ON CONFLICT(table_name, id) DO UPDATE SET data = excluded.data, updated_at = datetime('now')"
+      ).bind(targetId, JSON.stringify(member));
+      await stmt.run();
+      return json({ ok: true });
     }
 
     if (request.method === "POST" && path === "/auth/passwords") {
@@ -823,23 +1013,47 @@ async function handle(request, env, ctx) {
         for (const row of rows) {
           const stats = await ContextEngine.getStats(env, table, row.id);
           if (stats) row._stats = stats;
+          if (table === "members") { delete row.personalCodeHash; delete row.accessCodeHash; }
         }
         return json(rows);
       }
       if (request.method === "GET" && id) {
         const context = await ContextEngine.getFullContext(env, table, id);
         if (!context) return err("غير موجود", 404);
+        const itemOut = { ...context.item };
+        if (table === "members") { delete itemOut.personalCodeHash; delete itemOut.accessCodeHash; }
         // نُبقي شكل الاستجابة الأساسي كما هو (بيانات العنصر) مع إثرائه بالسياق، دون كسر الواجهة الحالية
-        return json({ ...context.item, _relationships: context.relationships, _stats: context.stats, _activity: context.activity });
+        return json({ ...itemOut, _relationships: context.relationships, _stats: context.stats, _activity: context.activity });
       }
 
       const payload = await verifyToken(getAuth(request), getSecret(env));
       if (!payload) return err("غير مصرّح — يلزم تسجيل الدخول", 401);
-      if (!canWrite(payload.role, table, request.method)) return err("لا تملك صلاحية التعديل على هذه الوحدة", 403);
+      const __action = request.method === "POST" ? "CREATE" : request.method === "DELETE" ? "DELETE" : "EDIT";
+      let __body = null;
+      if (request.method === "PUT" || request.method === "POST") {
+        __body = await request.clone().json().catch(() => ({}));
+      }
+      const __decision = await resolvePermission(env, payload, __action, table, id, __body);
+      if (!__decision.allowed) return err(__decision.reason || "لا تملك صلاحية التعديل على هذه الوحدة", 403);
 
       // -------- POST/PUT/DELETE: المسار لا يستدعي منطق الربط مباشرة، بل يبني معاملة ذرية عبر batch() ثم يُطلِق حدثًا --------
       if (request.method === "POST") {
         const body = await request.json().catch(() => ({}));
+        let __plainAccessCode = null;
+        // -------- حالة خاصة: إنشاء حساب عضو (Members/Users) — البنود 2-6 --------
+        if (table === "members") {
+          if (normalizeRole(payload.role) !== "leader") {
+            return err("إنشاء حساب عضو بصلاحياته يتطلب صلاحية القائد", 403);
+          }
+          const { plain, hash } = await generateUniqueAccessCode(env, getSecret(env));
+          __plainAccessCode = plain;
+          body.accessCodeHash = hash;
+          body.permissions = Array.isArray(body.permissions) ? body.permissions : [];
+          body.accountStatus = "active";
+          const nowIso = new Date().toISOString();
+          body.accountCreatedAt = nowIso;
+          body.accountUpdatedAt = nowIso;
+        }
         const rowId = body.id || crypto.randomUUID();
         const finalData = { ...body, id: rowId };
         // ON CONFLICT: قد يصل نفس المعرّف مرتين (استيراد نسخة احتياطية، إعادة محاولة الشبكة...)
@@ -852,10 +1066,43 @@ async function handle(request, env, ctx) {
         await env.DB.batch([recordStmt, ...critical]); // ذري: السجل + الربط الصريح + سجل النشاط معًا أو لا شيء منهم
         ctx.waitUntil(EventBus.emit(EVENTS.ENTITY_CREATED, event));
         ctx.waitUntil(RuleEngine.dispatchReactive(EVENTS.ENTITY_CREATED, event, ContextEngine));
+        if (table === "members") {
+          ctx.waitUntil(ContextEngine.logActivity(env, "members", rowId, "member.created", `أنشأ القائد حساب العضو ${finalData.name || rowId}`));
+          const outMember = { ...finalData };
+          delete outMember.accessCodeHash;
+          return json({ ...outMember, accessCode: __plainAccessCode }, 201);
+        }
         return json(finalData, 201);
       }
       if (request.method === "PUT" && id) {
         const body = await request.json().catch(() => ({}));
+        let __memberEvents = [];
+        // -------- حالة خاصة: تعديل حساب عضو (Members/Users) — البنود 4، 7، 8، 9 --------
+        if (table === "members") {
+          const existingMember = await getRecordById(env, "members", id);
+          const touchedSensitive = MEMBER_SENSITIVE_FIELDS.filter(f =>
+            Object.prototype.hasOwnProperty.call(body, f) &&
+            JSON.stringify(body[f]) !== JSON.stringify(existingMember ? existingMember[f] : undefined)
+          );
+          if (touchedSensitive.length > 0 && normalizeRole(payload.role) !== "leader") {
+            return err("لا يملك العضو صلاحية تعديل الصلاحيات أو الدور أو حالة الحساب — للقائد فقط", 403);
+          }
+          if (touchedSensitive.length > 0 && existingMember) {
+            body.accountUpdatedAt = new Date().toISOString();
+            if (touchedSensitive.includes("permissions")) {
+              __memberEvents.push(["permissions.updated", `القائد عدّل صلاحيات ${existingMember.name || id}`]);
+            }
+            if (touchedSensitive.includes("role")) {
+              __memberEvents.push(["role.updated", `القائد غيّر دور/مهمة ${existingMember.name || id}`]);
+            }
+            if (touchedSensitive.includes("accountStatus")) {
+              if (body.accountStatus === "disabled") __memberEvents.push(["member.disabled", `القائد عطّل حساب ${existingMember.name || id}`]);
+              else if (body.accountStatus === "active") __memberEvents.push(["member.enabled", `القائد أعاد تفعيل حساب ${existingMember.name || id}`]);
+            }
+          }
+          // لا يمكن تعديل accessCodeHash عبر هذا المسار العام إطلاقًا (يُولَّد فقط عند الإنشاء)، حتى للقائد — يمنع أي تسريب/تلاعب بالكود من الواجهة
+          if (Object.prototype.hasOwnProperty.call(body, "accessCodeHash")) delete body.accessCodeHash;
+        }
         const finalData = { ...body, id };
         const recordStmt = env.DB.prepare(
           "INSERT INTO records (table_name, id, data) VALUES (?, ?, ?) ON CONFLICT(table_name, id) DO UPDATE SET data = excluded.data, updated_at = datetime('now')"
@@ -865,6 +1112,12 @@ async function handle(request, env, ctx) {
         await env.DB.batch([recordStmt, ...critical]);
         ctx.waitUntil(EventBus.emit(EVENTS.ENTITY_UPDATED, event));
         ctx.waitUntil(RuleEngine.dispatchReactive(EVENTS.ENTITY_UPDATED, event, ContextEngine));
+        if (table === "members") {
+          ctx.waitUntil(ContextEngine.logActivity(env, "members", id, "member.updated", `تحديث بيانات بواسطة ${payload.role}`));
+          for (const [evt, summary] of __memberEvents) {
+            ctx.waitUntil(ContextEngine.logActivity(env, "members", id, evt, summary));
+          }
+        }
         return json({ ok: true });
       }
       if (request.method === "DELETE" && id) {
