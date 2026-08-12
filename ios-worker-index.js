@@ -841,6 +841,21 @@ async function generateUniqueAccessCode(env, secret) {
   }
   throw new Error("تعذّر توليد access_code فريد بعد عدة محاولات");
 }
+const CUSTOM_ACCESS_CODE_MIN_LEN = 4;
+// يسمح للقائد بكتابة كود دخول بنفسه (بدل التوليد التلقائي) — يتحقق من التفرّد بنفس آلية الكود المُولَّد
+// excludeMemberId: عند تحديث كود عضو موجود، لا نرفض الكود إن كان مملوكًا لنفس العضو (تحديث بلا تغيير)
+async function setCustomAccessCode(env, secret, rawCode, excludeMemberId) {
+  const plain = String(rawCode == null ? "" : rawCode).trim();
+  if (plain.length < CUSTOM_ACCESS_CODE_MIN_LEN) {
+    return { error: `كود الدخول المخصص يجب أن يكون ${CUSTOM_ACCESS_CODE_MIN_LEN} أحرف على الأقل` };
+  }
+  const existing = await findMemberByAccessCode(env, plain, secret);
+  if (existing && existing.id !== excludeMemberId) {
+    return { error: "كود الدخول هذا مستخدم بالفعل لعضو آخر — اختر كودًا آخر" };
+  }
+  const hash = await hashAccessCode(plain, secret);
+  return { plain, hash };
+}
 const MEMBER_SENSITIVE_FIELDS = ["permissions", "role", "accountStatus", "accessCodeHash"];
 
 async function resolvePermission(env, payload, action, table, id, body) {
@@ -1063,6 +1078,33 @@ async function handle(request, env, ctx) {
       return json({ ...outMember, accessCode: plain }); // يُعرض مرة واحدة فقط
     }
 
+    if (request.method === "POST" && path === "/auth/set-access-code") {
+      // -------- يسمح للقائد بكتابة كود دخول بنفسه لعضو موجود (بدل التوليد التلقائي) --------
+      // يبقى الكود قابلاً للعرض لاحقًا في أي وقت عبر /auth/reveal-access-code (وليس مرة واحدة فقط)
+      const payload = await verifyToken(getAuth(request), getSecret(env));
+      if (!payload || normalizeRole(payload.role) !== "leader") return err("غير مصرّح — للقائد فقط", 403);
+      const { memberId: targetId, accessCode: customCode } = await request.json().catch(() => ({}));
+      if (!targetId || !customCode) return err("memberId و accessCode مطلوبان");
+      const member = await getRecordById(env, "members", targetId);
+      if (!member) return err("العضو غير موجود", 404);
+      const result = await setCustomAccessCode(env, getSecret(env), customCode, targetId);
+      if (result.error) return err(result.error, 409);
+      member.accessCodeHash = result.hash;
+      member.accessCodeEnc = await encryptAccessCode(result.plain, getSecret(env));
+      member.accountUpdatedAt = new Date().toISOString();
+      const stmt = env.DB.prepare(
+        "INSERT INTO records (table_name, id, data) VALUES ('members', ?, ?) ON CONFLICT(table_name, id) DO UPDATE SET data = excluded.data, updated_at = datetime('now')"
+      ).bind(targetId, JSON.stringify(member));
+      await stmt.run();
+      ctx.waitUntil(ContextEngine.logActivity(env, "members", targetId, "access_code.custom_set", `القائد عيّن كود دخول مخصص لـ ${member.name || targetId}`));
+      const outMember = { ...member };
+      outMember.hasAccessCode = !!outMember.accessCodeHash;
+      delete outMember.accessCodeHash;
+      delete outMember.accessCodeEnc;
+      delete outMember.personalCodeHash;
+      return json({ ...outMember, accessCode: result.plain, name: member.name });
+    }
+
     if (request.method === "POST" && path === "/auth/passwords") {
       const payload = await verifyToken(getAuth(request), getSecret(env));
       if (!payload || payload.role !== "leader") return err("غير مصرّح", 403);
@@ -1124,7 +1166,18 @@ async function handle(request, env, ctx) {
           if (normalizeRole(payload.role) !== "leader") {
             return err("إنشاء حساب عضو بصلاحياته يتطلب صلاحية القائد", 403);
           }
-          const { plain, hash } = await generateUniqueAccessCode(env, getSecret(env));
+          // -------- كود دخول مخصص: إن كتب القائد كودًا بنفسه (customAccessCode) نستخدمه، وإلا نولّد كودًا عشوائيًا كما كان --------
+          const hasCustomCode = typeof body.customAccessCode === "string" && body.customAccessCode.trim() !== "";
+          let plain, hash;
+          if (hasCustomCode) {
+            const result = await setCustomAccessCode(env, getSecret(env), body.customAccessCode, null);
+            if (result.error) return err(result.error, 409);
+            plain = result.plain; hash = result.hash;
+          } else {
+            const gen = await generateUniqueAccessCode(env, getSecret(env));
+            plain = gen.plain; hash = gen.hash;
+          }
+          delete body.customAccessCode; // لا يُخزَّن الكود الصريح أبدًا في السجل — فقط hash + enc
           __plainAccessCode = plain;
           body.accessCodeHash = hash;
           body.accessCodeEnc = await encryptAccessCode(plain, getSecret(env));
